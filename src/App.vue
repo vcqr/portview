@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
@@ -8,10 +8,10 @@ import ConnectionsTable from "./components/ConnectionsTable.vue";
 import MenuBar from "./components/MenuBar.vue";
 import StatusBar from "./components/StatusBar.vue";
 import ContextMenu from "./components/ContextMenu.vue";
-import ProcessDetailsModal from "./components/ProcessDetailsModal.vue";
+import ProcessDrawer from "./components/ProcessDrawer.vue";
 import AboutDialog from "./components/AboutDialog.vue";
 import MessageBox from "./components/MessageBox.vue";
-import type { TcpConnection, ProcessDetails, SortColumn, SortDirection, ConnectionsSnapshot, NetRate, AppSettings } from "@/types/connection";
+import type { TcpConnection, ProcessDetails, ProcessLineage, PortBinding, SortColumn, SortDirection, ConnectionsSnapshot, NetRate, AppSettings } from "@/types/connection";
 
 // 初始化国际化
 const { t, locale } = useI18n();
@@ -59,13 +59,29 @@ const selectedConnection = ref<TcpConnection | null>(null);
 // 选中行相关状态
 const clickedConnection = ref<TcpConnection | null>(null);
 
-// 进程详情弹窗相关状态
+// 进程详情抽屉相关状态
 const showProcessDetails = ref(false);
 const processDetails = ref<ProcessDetails | null>(null);
-const selectedPid = ref<number | null>(null); // 当前详情弹窗展示的进程
+const selectedPid = ref<number | null>(null); // 当前详情抽屉展示的进程
 const processGone = ref(false); // 轮询时发现进程已退出
 const processRefreshing = ref(false); // 手动刷新进行中
 let processDetailsTimer: number | null = null;
+// 进程调用链（打开抽屉时拉取一次；断链标记 parent_exited 由后端判定）
+const processLineage = ref<ProcessLineage | null>(null);
+const lineageLoading = ref(false);
+// 抽屉内的进程导航历史：双击链上/子进程节点进入新进程时压栈，
+// 返回按钮逐级弹出；从连接表格发起的打开视为新的浏览起点（清空历史）
+const lineageNavHistory = ref<number[]>([]);
+const LINEAGE_NAV_HISTORY_MAX = 20;
+// 从调用链点击节点后在连接列表中高亮的 PID（null = 未启用）
+const lineageHighlightPid = ref<number | null>(null);
+// 详情抽屉宽度（左缘可拖拽调整，持久化到 localStorage）
+const drawerWidth = ref<number>(
+  Number.parseFloat(localStorage.getItem("drawerWidth") || "") || 400,
+);
+const connectionsTableRef = ref<InstanceType<typeof ConnectionsTable> | null>(
+  null,
+);
 
 // 获取进程详情；silent 用于轮询场景——进程退出时不弹错误框。
 // 返回是否成功
@@ -105,12 +121,16 @@ function stopProcessDetailsRefresh() {
   }
 }
 
-// 关闭弹窗时停止刷新并清除数据，避免下次打开闪现上一个进程的旧信息
+// 关闭抽屉时停止刷新并清除数据，避免下次打开闪现上一个进程的旧信息；
+// 同时清除调用链高亮与导航历史
 function setProcessDetailsVisible(visible: boolean) {
   showProcessDetails.value = visible;
   if (!visible) {
     stopProcessDetailsRefresh();
     processDetails.value = null;
+    processLineage.value = null;
+    lineageHighlightPid.value = null;
+    lineageNavHistory.value = [];
   }
 }
 
@@ -122,21 +142,156 @@ async function refreshProcessDetails() {
   processRefreshing.value = false;
 }
 
-// 显示进程详情弹窗：先清除上一个进程的数据，打开后再拉取；
-// 拉取失败时关闭空弹窗（错误信息已单独提示）
+// 拉取当前进程的调用链（打开抽屉或手动重新追踪时调用；
+// 调用链基本静态，不随秒级轮询刷新）
+async function loadProcessLineage(pid: number) {
+  lineageLoading.value = true;
+  try {
+    processLineage.value = await invoke<ProcessLineage>(
+      "get_process_lineage",
+      { pid },
+    );
+  } catch (error) {
+    console.error(t("alerts.getLineageFailed", { error }), error);
+    showNotification(t("alerts.getLineageFailed", { error }), "error");
+  } finally {
+    lineageLoading.value = false;
+  }
+}
+
+// 手动重新追踪调用链
+function refreshProcessLineage() {
+  if (selectedPid.value === null || lineageLoading.value) return;
+  loadProcessLineage(selectedPid.value);
+}
+
+// 调用链/子进程节点单击：在连接列表中高亮该 PID 的行并滚动定位；
+// 再次点击同一节点取消高亮。链上祖先进程大多没有网络连接，提示用户
+function highlightPidInTable(pid: number) {
+  if (lineageHighlightPid.value === pid) {
+    lineageHighlightPid.value = null;
+    return;
+  }
+  lineageHighlightPid.value = pid;
+  void nextTick(() => {
+    const found = connectionsTableRef.value?.scrollToPid(pid) ?? false;
+    if (!found) {
+      showNotification(t("alerts.noConnectionsForPid"), "info");
+    }
+  });
+}
+
+// 加载指定进程到抽屉（不处理导航历史；由 inspectProcess / goBack 调用）
+async function loadProcessView(pid: number) {
+  selectedPid.value = pid;
+  lineageHighlightPid.value = null;
+  processGone.value = false;
+  processDetails.value = null;
+  processLineage.value = null;
+  showProcessDetails.value = true;
+  const ok = await loadProcessDetails(pid);
+  if (!ok) {
+    setProcessDetailsVisible(false);
+    return;
+  }
+  startProcessDetailsRefresh(pid);
+  loadProcessLineage(pid);
+}
+
+// 双击调用链/子进程节点：把当前进程压入导航历史后切换为查看该进程
+async function inspectProcess(pid: number) {
+  if (!showProcessDetails.value) {
+    lineageNavHistory.value = [];
+    await loadProcessView(pid);
+    return;
+  }
+  if (selectedPid.value === pid) return;
+  if (selectedPid.value !== null) {
+    lineageNavHistory.value.push(selectedPid.value);
+    if (lineageNavHistory.value.length > LINEAGE_NAV_HISTORY_MAX) {
+      lineageNavHistory.value.shift();
+    }
+  }
+  await loadProcessView(pid);
+}
+
+// 返回上一进程：弹出导航历史栈顶并恢复查看
+function goBackInLineage() {
+  const prev = lineageNavHistory.value.pop();
+  if (prev === undefined) return;
+  loadProcessView(prev);
+}
+
+// 抽屉拖宽：更新并持久化
+function onDrawerWidthChange(width: number) {
+  drawerWidth.value = width;
+  localStorage.setItem("drawerWidth", String(width));
+}
+
+// 菜单栏"追踪"入口：输入端口号或 PID 直接打开调用链，不依赖表格行。
+// 数字输入优先按端口实时解析（端口是本应用主域），无绑定再回退按 PID
+const traceInProgress = ref(false);
+async function traceTarget(input: string) {
+  if (traceInProgress.value) return;
+  const trimmed = input.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    showNotification(t("alerts.traceInvalidInput"), "error");
+    return;
+  }
+  const num = Number(trimmed);
+  traceInProgress.value = true;
+  try {
+    // ① 按端口解析：多个进程共享端口时优先选 LISTEN 的那个
+    let bindings: PortBinding[] = [];
+    try {
+      bindings = await invoke<PortBinding[]>("get_port_bindings", { port: num });
+    } catch {
+      // 端口枚举失败视为无绑定，继续按 PID 尝试
+    }
+    const withPid = bindings.filter((b) => b.pid);
+    const target =
+      withPid.find((b) => b.state === "LISTEN") ?? withPid[0];
+    if (target?.pid) {
+      const pidCount = new Set(withPid.map((b) => b.pid)).size;
+      if (pidCount > 1) {
+        showNotification(
+          t("alerts.tracePortShared", {
+            port: num,
+            count: pidCount,
+            pid: target.pid,
+          }),
+          "info",
+        );
+      }
+      lineageNavHistory.value = [];
+      selectedConnection.value = null;
+      await loadProcessView(target.pid);
+      return;
+    }
+
+    // ② 端口无绑定：按 PID 尝试（对不存在的进程后端会报错）
+    try {
+      await invoke("get_process_details", { pid: num });
+    } catch {
+      showNotification(t("alerts.traceNotFound", { input: trimmed }), "error");
+      return;
+    }
+    lineageNavHistory.value = [];
+    selectedConnection.value = null;
+    await loadProcessView(num);
+  } finally {
+    traceInProgress.value = false;
+  }
+}
+
+// 显示进程详情抽屉：先清除上一个进程的数据，打开后再拉取；
+// 拉取失败时关闭空抽屉（错误信息已单独提示）。
+// 从连接表格发起属于新的浏览起点，清空导航历史
 async function showProcessDetailsDialog(conn: TcpConnection) {
   if (!conn.pid) return;
   selectedConnection.value = conn; // 保存选中的连接以获取图标信息
-  selectedPid.value = conn.pid;
-  processGone.value = false;
-  processDetails.value = null;
-  showProcessDetails.value = true;
-  const ok = await loadProcessDetails(conn.pid);
-  if (!ok) {
-    showProcessDetails.value = false;
-    return;
-  }
-  startProcessDetailsRefresh(conn.pid);
+  lineageNavHistory.value = [];
+  await loadProcessView(conn.pid);
 }
 
 // 关于对话框相关状态
@@ -881,22 +1036,48 @@ function checkSystemThemePreference() {
       @toggleTheme="toggleTheme"
       @setProtocolFilter="setProtocolFilter"
       @showAboutDialog="showAbout = true"
+      @traceTarget="traceTarget"
     />
 
-    <!-- 表格 -->
-    <ConnectionsTable
-      :connections="connections"
-      :clickedConnection="clickedConnection"
-      :sortColumn="sortColumn"
-      :sortDirection="sortDirection"
-      :customColumnWidths="customColumnWidths"
-      :isLoading="isLoading"
-      @update:clickedConnection="clickedConnection = $event"
-      @toggleSort="toggleSort"
-      @showContextMenuHandler="showContextMenuHandler"
-      @showProcessDetailsDialog="showProcessDetailsDialog"
-      @update:customColumnWidths="customColumnWidths = $event"
-    />
+    <!-- 中部：连接表格 + 进程详情抽屉 -->
+    <div class="main-row">
+      <ConnectionsTable
+        ref="connectionsTableRef"
+        :connections="connections"
+        :clickedConnection="clickedConnection"
+        :sortColumn="sortColumn"
+        :sortDirection="sortDirection"
+        :customColumnWidths="customColumnWidths"
+        :isLoading="isLoading"
+        :highlightPid="lineageHighlightPid"
+        @update:clickedConnection="clickedConnection = $event"
+        @toggleSort="toggleSort"
+        @showContextMenuHandler="showContextMenuHandler"
+        @showProcessDetailsDialog="showProcessDetailsDialog"
+        @update:customColumnWidths="customColumnWidths = $event"
+      />
+
+      <!-- 进程详情抽屉（含调用链） -->
+      <ProcessDrawer
+        :show="showProcessDetails"
+        :processDetails="processDetails"
+        :lineage="processLineage"
+        :lineageLoading="lineageLoading"
+        :processIcon="selectedConnection?.icon || null"
+        :processGone="processGone"
+        :refreshing="processRefreshing"
+        :highlightPid="lineageHighlightPid"
+        :width="drawerWidth"
+        :canGoBack="lineageNavHistory.length > 0"
+        @update:show="setProcessDetailsVisible"
+        @refresh="refreshProcessDetails"
+        @refreshLineage="refreshProcessLineage"
+        @back="goBackInLineage"
+        @highlight="highlightPidInTable"
+        @inspect="inspectProcess"
+        @update:width="onDrawerWidthChange"
+      />
+    </div>
 
     <!-- 右键菜单 -->
     <ContextMenu
@@ -911,17 +1092,6 @@ function checkSystemThemePreference() {
 
     <!-- 状态栏 -->
     <StatusBar :statusBarInfo="statusBarInfo" :showNetTraffic="showNetTraffic" />
-
-    <!-- 进程详情弹窗 -->
-    <ProcessDetailsModal
-      :showProcessDetails="showProcessDetails"
-      :processDetails="processDetails"
-      :processIcon="selectedConnection?.icon || null"
-      :processGone="processGone"
-      :refreshing="processRefreshing"
-      @update:showProcessDetails="setProcessDetailsVisible"
-      @refresh="refreshProcessDetails"
-    />
 
     <!-- 关于对话框 -->
     <AboutDialog
@@ -971,6 +1141,16 @@ function checkSystemThemePreference() {
   flex: 1 1 auto;
   min-height: 0; /* 允许flex子项收缩 */
   min-width: 0; /* 允许flex子项收缩 */
+}
+
+/* 中部横排：连接表格（弹性占满）；进程详情抽屉为浮层，
+   以本容器为定位基准悬停在表格上方，不挤压表格布局 */
+.main-row {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0; /* 允许flex子项收缩 */
+  min-width: 0;
 }
 </style>
 

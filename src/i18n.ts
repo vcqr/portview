@@ -14,9 +14,7 @@ const i18n = createI18n<[MessageSchema], 'zh' | 'en'>({
   messages: {
     zh: zhCN,
     en: enUS
-  },
-  // 支持嵌套路径访问
-  allowComposition: true,
+  }
 });
 
 export default i18n;

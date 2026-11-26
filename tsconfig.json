@@ -14,10 +14,9 @@
     "noEmit": true,
     "jsx": "preserve",
 
-    /* Path aliases */
-    "baseUrl": ".",
+    /* Path aliases（TS 6 起无需 baseUrl，paths 相对 tsconfig 所在目录解析） */
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["./src/*"]
     },
 
     /* Linting */

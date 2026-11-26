@@ -31,7 +31,7 @@
 <script setup lang="ts">
 import { useI18n } from "vue-i18n";
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { X } from "lucide-vue-next";
+import { X } from "@lucide/vue";
 
 interface Props {
   showAbout: boolean;

@@ -35,7 +35,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
-import { Info, FolderOpen, XCircle } from "lucide-vue-next";
+import { Info, FolderOpen, XCircle } from "@lucide/vue";
 import type { TcpConnection } from "@/types/connection";
 
 // 定义组件属性

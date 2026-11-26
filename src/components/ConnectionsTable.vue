@@ -177,7 +177,10 @@
               'changed-connection': conn.hasChanged,
               'new-connection': conn.isNew,
               'deleted-connection': conn.isDeleted,
+              'lineage-highlight':
+                highlightPid != null && conn.pid === highlightPid,
             }"
+            :data-pid="conn.pid ?? ''"
           >
             <td class="process-name-cell">
               <div class="process-with-icon" :title="conn.process_name || '-'">
@@ -213,7 +216,7 @@
 <script setup lang="ts">
 import { computed, watch, nextTick, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
-import { Globe } from "lucide-vue-next";
+import { Globe } from "@lucide/vue";
 import type { TcpConnection, SortColumn, SortDirection } from "@/types/connection";
 
 // 定义组件属性
@@ -224,6 +227,7 @@ interface Props {
   sortDirection: SortDirection;
   customColumnWidths: Record<string, number>;
   isLoading?: boolean;
+  highlightPid?: number | null; // 调用链联动的 PID 高亮（null = 未启用）
 }
 
 const props = defineProps<Props>();
@@ -252,6 +256,18 @@ const sortDirection = computed(() => props.sortDirection);
 
 // 列宽相关
 const customColumnWidths = computed(() => props.customColumnWidths);
+
+// 滚动定位到指定 PID 的第一行（调用链节点单击联动），返回是否找到
+const scrollToPid = (pid: number): boolean => {
+  const el = document.querySelector(
+    `.connections-table tbody tr[data-pid="${pid}"]`,
+  );
+  if (!el) return false;
+  el.scrollIntoView({ block: "center", behavior: "smooth" });
+  return true;
+};
+
+defineExpose({ scrollToPid });
 
 // 骨架屏每行的占位宽度（百分比）
 const skeletonWidths = [92, 38, 52, 68, 30, 60, 42, 78, 34, 64, 46, 72];
@@ -689,6 +705,17 @@ const formatDate = (timestamp: number | null): string => {
 
 .connections-table tbody tr.selected-row td {
   color: var(--text-1);
+}
+
+/* 调用链联动高亮：虚线描边圈出该进程的所有连接行（与选中行区分） */
+.connections-table tbody tr.lineage-highlight {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background-color: var(--accent-weak);
+}
+
+.connections-table tbody tr.lineage-highlight td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 /* 冗余列样式 - 填充剩余空间 */

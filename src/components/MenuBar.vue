@@ -28,24 +28,12 @@
 
       <div class="menu-group">
         <span class="menu-label">{{ t("menu.state") }}</span>
-        <select
-          :value="filterState"
-          @change="handleStateChange"
-          class="control-select state-select"
-        >
-          <option value="all">{{ t("menu.stateAll") }}</option>
-          <option value="LISTEN">{{ t("menu.stateListen") }}</option>
-          <option value="ESTABLISHED">{{ t("menu.stateEstablished") }}</option>
-          <option value="TIME_WAIT">{{ t("menu.stateTimeWait") }}</option>
-          <option value="CLOSE_WAIT">{{ t("menu.stateCloseWait") }}</option>
-          <option value="SYN_SENT">{{ t("menu.stateSynSent") }}</option>
-          <option value="SYN_RECV">{{ t("menu.stateSynRecv") }}</option>
-          <option value="FIN_WAIT1">{{ t("menu.stateFinWait1") }}</option>
-          <option value="FIN_WAIT2">{{ t("menu.stateFinWait2") }}</option>
-          <option value="LAST_ACK">{{ t("menu.stateLastAck") }}</option>
-          <option value="CLOSING">{{ t("menu.stateClosing") }}</option>
-          <option value="UNCONN">{{ t("menu.stateUnconn") }}</option>
-        </select>
+        <DropdownSelect
+          class="state-select"
+          :modelValue="filterState"
+          :options="stateOptions"
+          @update:modelValue="handleStateChange"
+        />
       </div>
     </div>
 
@@ -75,6 +63,23 @@
 
     <div class="menu-cluster">
       <div class="menu-group">
+        <span class="menu-label">{{ t("menu.trace") }}</span>
+        <input
+          type="text"
+          v-model="traceInput"
+          :placeholder="t('menu.tracePlaceholder')"
+          class="control-input trace-input"
+          @keydown.enter="traceTarget"
+        />
+        <button class="control-btn" @click="traceTarget">
+          <Waypoints :size="13" class="btn-icon" />
+          {{ t("menu.traceButton") }}
+        </button>
+      </div>
+    </div>
+
+    <div class="menu-cluster">
+      <div class="menu-group">
         <span class="menu-label">{{ t("menu.autoRefresh") }}</span>
         <button
           :class="['control-btn', 'refresh-toggle-btn', { active: isAutoRefreshEnabled }]"
@@ -87,34 +92,25 @@
           />
           {{ isAutoRefreshEnabled ? t("menu.refreshStop") : t("menu.refreshStart") }}
         </button>
-        <select
-          :value="selectedRefreshInterval"
-          @change="handleRefreshIntervalChange"
-          class="control-select refresh-interval-select"
+        <DropdownSelect
+          class="refresh-interval-select"
+          :modelValue="String(selectedRefreshInterval)"
+          :options="intervalOptions"
           :disabled="!isAutoRefreshEnabled"
-        >
-          <option
-            v-for="interval in refreshIntervals"
-            :key="interval"
-            :value="interval"
-          >
-            {{ interval }}{{ t("menu.refreshInterval") }}
-          </option>
-        </select>
+          @update:modelValue="handleRefreshIntervalChange"
+        />
       </div>
     </div>
 
     <div class="menu-cluster">
       <div class="menu-group">
         <span class="menu-label">{{ t("menu.language") }}</span>
-        <select
-          :value="$i18n.locale"
-          @change="handleLanguageChange"
-          class="control-select lang-select"
-        >
-          <option value="zh">{{ t("zh") }}</option>
-          <option value="en">{{ t("en") }}</option>
-        </select>
+        <DropdownSelect
+          class="lang-select"
+          :modelValue="locale"
+          :options="langOptions"
+          @update:modelValue="handleLanguageChange"
+        />
       </div>
 
       <div class="menu-group">
@@ -135,8 +131,10 @@
 </template>
 
 <script setup lang="ts">
+import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { RefreshCw, Sun, Moon } from "lucide-vue-next";
+import { RefreshCw, Sun, Moon, Waypoints } from "@lucide/vue";
+import DropdownSelect from "./DropdownSelect.vue";
 
 // 定义组件属性
 interface Props {
@@ -150,7 +148,7 @@ interface Props {
   isDarkMode: boolean;
 }
 
-defineProps<Props>();
+const props = defineProps<Props>();
 
 // 定义事件发射器
 interface Emits {
@@ -165,12 +163,53 @@ interface Emits {
   (e: "toggleTheme"): void;
   (e: "setProtocolFilter", protocol: "all" | "TCP" | "UDP"): void;
   (e: "showAboutDialog"): void;
+  (e: "traceTarget", value: string): void;
 }
 
 const emit = defineEmits<Emits>();
 
 // 使用国际化
-const { t } = useI18n();
+const { t, locale } = useI18n();
+
+// ===== 自定义下拉的候选项（computed 保证语言切换后文案联动） =====
+const stateOptions = computed(() => [
+  { value: "all", label: t("menu.stateAll") },
+  { value: "LISTEN", label: t("menu.stateListen") },
+  { value: "ESTABLISHED", label: t("menu.stateEstablished") },
+  { value: "TIME_WAIT", label: t("menu.stateTimeWait") },
+  { value: "CLOSE_WAIT", label: t("menu.stateCloseWait") },
+  { value: "SYN_SENT", label: t("menu.stateSynSent") },
+  { value: "SYN_RECV", label: t("menu.stateSynRecv") },
+  { value: "FIN_WAIT1", label: t("menu.stateFinWait1") },
+  { value: "FIN_WAIT2", label: t("menu.stateFinWait2") },
+  { value: "LAST_ACK", label: t("menu.stateLastAck") },
+  { value: "CLOSING", label: t("menu.stateClosing") },
+  { value: "UNCONN", label: t("menu.stateUnconn") },
+]);
+
+// 刷新间隔候选项：DropdownSelect 的值统一为字符串，选中时再转回数字
+const intervalOptions = computed(() =>
+  props.refreshIntervals.map((n) => ({
+    value: String(n),
+    label: `${n}${t("menu.refreshInterval")}`,
+  })),
+);
+
+const langOptions = computed(() => [
+  { value: "zh", label: t("zh") },
+  { value: "en", label: t("en") },
+]);
+
+// 追踪输入框：输入值仅在提交时使用，不需要同步给父组件，本地持有即可
+const traceInput = ref("");
+
+// 提交追踪（Enter 或按钮）：清空输入便于下次输入；结果由父组件通知
+const traceTarget = () => {
+  const value = traceInput.value.trim();
+  if (value === "") return;
+  emit("traceTarget", value);
+  traceInput.value = "";
+};
 
 // 方法
 const setProtocolFilter = (protocol: "all" | "TCP" | "UDP") => {
@@ -185,9 +224,8 @@ const showAboutDialog = () => {
   emit('showAboutDialog');
 };
 
-const handleStateChange = (event: Event) => {
-  const target = event.target as HTMLSelectElement;
-  emit('update:filterState', target.value);
+const handleStateChange = (value: string) => {
+  emit('update:filterState', value);
 };
 
 const handleSearchProcessInput = (event: Event) => {
@@ -200,17 +238,14 @@ const handleSearchLocalPortInput = (event: Event) => {
   emit('update:searchLocalPort', target.value);
 };
 
-const handleRefreshIntervalChange = (event: Event) => {
-  const target = event.target as HTMLSelectElement;
-  const interval = Number(target.value);
+const handleRefreshIntervalChange = (value: string) => {
+  const interval = Number(value);
   emit('update:selectedRefreshInterval', interval);
   emit('changeRefreshInterval', interval);
 };
 
-const handleLanguageChange = (event: Event) => {
-  const target = event.target as HTMLSelectElement;
-  const lang = target.value as 'zh' | 'en';
-  emit('changeLanguage', lang);
+const handleLanguageChange = (value: string) => {
+  emit('changeLanguage', value as 'zh' | 'en');
 };
 
 const handleThemeToggle = () => {
@@ -219,14 +254,15 @@ const handleThemeToggle = () => {
 </script>
 
 <style scoped>
-/* 主菜单容器：单行排列，窗口宽度不足时允许被裁剪（保持原有行为） */
+/* 主菜单容器：按功能分组，空间不足时自动换行到下一行，
+   保证所有控件始终可见（下拉面板已 Teleport 到 body，不受换行布局影响） */
 .menu-bar {
   display: flex;
   align-items: center;
-  flex-wrap: nowrap;
-  min-width: fit-content;
+  flex-wrap: wrap;
+  row-gap: 6px;
   width: 100%;
-  padding: 7px 10px;
+  padding: 7px 8px;
   background-color: var(--bg-panel);
   border-bottom: 1px solid var(--border);
   position: sticky;
@@ -238,8 +274,8 @@ const handleThemeToggle = () => {
 .menu-cluster {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 0 14px;
+  gap: 10px;
+  padding: 0 8px;
   flex-shrink: 0;
   white-space: nowrap;
 }
@@ -256,7 +292,7 @@ const handleThemeToggle = () => {
 .menu-group {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   white-space: nowrap;
   flex-shrink: 0;
 }
@@ -269,7 +305,6 @@ const handleThemeToggle = () => {
 
 /* ===== 通用控件 ===== */
 .control-input,
-.control-select,
 .control-btn {
   height: var(--control-height);
   padding: 0 8px;
@@ -284,7 +319,7 @@ const handleThemeToggle = () => {
 }
 
 .control-input {
-  width: 130px;
+  width: 108px;
   color: var(--text-1);
 }
 
@@ -296,27 +331,21 @@ const handleThemeToggle = () => {
   width: 90px;
 }
 
-.control-input:focus,
-.control-select:focus {
+/* 追踪输入框：紧凑宽度，容纳端口号与 PID */
+.trace-input {
+  width: 84px;
+  font-family: var(--font-mono);
+}
+
+.control-input:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-weak);
 }
 
 .control-input:hover,
-.control-select:hover:not(:disabled),
 .control-btn:hover {
   border-color: var(--accent);
-}
-
-.control-select {
-  cursor: pointer;
-}
-
-.control-select:disabled {
-  background-color: var(--bg-subtle);
-  color: var(--text-3);
-  cursor: not-allowed;
 }
 
 .control-btn {
@@ -351,7 +380,7 @@ const handleThemeToggle = () => {
 }
 
 .segment-btn {
-  padding: 0 12px;
+  padding: 0 9px;
   border: none;
   background-color: var(--bg-panel);
   color: var(--text-2);
@@ -407,7 +436,7 @@ const handleThemeToggle = () => {
   background-color: var(--accent-weak);
 }
 
-/* ===== 下拉宽度微调 ===== */
+/* ===== 下拉宽度微调（作用于 DropdownSelect 根元素） ===== */
 .state-select {
   min-width: 96px;
 }

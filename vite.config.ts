@@ -1,6 +1,10 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import { resolve } from "path";
+import { fileURLToPath } from "url";
+
+// ESM 下替代 __dirname（Vite 8 原生 config loader 不支持 __dirname）
+const dirname = fileURLToPath(new URL(".", import.meta.url));
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
@@ -33,7 +37,7 @@ export default defineConfig(async () => ({
   
   resolve: {
     alias: {
-      '@': resolve(__dirname, 'src'),
+      '@': resolve(dirname, 'src'),
     },
   },
 }));

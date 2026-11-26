@@ -2,7 +2,9 @@
 use image;
 use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState};
 use serde::{Deserialize, Serialize};
-use sysinfo::{Networks, Pid, ProcessRefreshKind, System, UpdateKind};
+use sysinfo::{
+    Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users,
+};
 use tauri::{Emitter, Manager};
 
 use std::collections::{HashMap, HashSet};
@@ -54,6 +56,40 @@ pub struct ProcessDetails {
     pub cpu_usage: f32,
     pub parent_pid: Option<u32>,
     pub start_time: u64,
+}
+
+// 调用链节点：祖先链与子进程列表共用
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineageNode {
+    pub pid: u32,
+    pub ppid: Option<u32>,
+    pub name: String,
+    pub command_line: String,
+    pub exe_path: Option<String>,
+    pub start_time: Option<u64>,
+    pub user: Option<String>,
+    pub icon: Option<String>, // Base64 PNG，按 exe_path 复用全局图标缓存
+    // 该节点的父进程已退出（PPID 槽位被回收复用或父进程已消失），
+    // 祖先链在此断裂——语义对齐 witr 的 ParentExited
+    pub parent_exited: bool,
+    pub is_target: bool, // 是否为当前查看的目标进程
+}
+
+// 进程调用链：沿 PPID 向上追溯到 PID 1 的完整祖先链 + 直接子进程
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessLineage {
+    pub nodes: Vec<LineageNode>,    // root → target 顺序
+    pub children: Vec<LineageNode>, // 目标进程的直接子进程
+}
+
+// 端口绑定条目：菜单栏"追踪"入口按端口实时解析的结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortBinding {
+    pub protocol: String,           // TCP / UDP
+    pub local_addr: String,
+    pub state: String,              // LISTEN / ESTABLISHED / UNCONN ...
+    pub pid: Option<u32>,
+    pub process_name: Option<String>,
 }
 
 // 将 netstat2 的 TCP 状态转换为字符串
@@ -148,30 +184,29 @@ fn update_setting(show_net: Option<bool>, close_to_quit: Option<bool>) {
 // 全局复用的 System 实例：sysinfo 的 CPU 占用依赖同一实例两次刷新的差值，
 // 且重建全量进程表代价高，不应每次轮询都重新创建
 lazy_static::lazy_static! {
-    static ref SYSTEM: Mutex<System> = Mutex::new(System::new());
+    // sysinfo 0.40 起 System::new() 返回 Result，仅在 sysinfo 不支持的平台上
+    // 失败；本项目目标平台（Windows/macOS/Linux）均在支持范围内
+    static ref SYSTEM: Mutex<System> =
+        Mutex::new(System::new().expect("failed to initialize sysinfo System"));
 }
 
 // 系统网络吞吐统计：sysinfo 的 NetworkData 是距上次刷新的增量，
 // 结合两次刷新的间隔换算为每秒速率
 struct NetRateState {
-    networks: Networks,
+    // sysinfo 0.40 的 Networks::new() 返回 Result，初始化失败时置 None
+    // （极少见的平台不支持场景），网速统计退化为全零
+    networks: Option<Networks>,
     last_refresh: Option<Instant>,
-    ticks_since_list_refresh: u32,
     down_bps: u64,
     up_bps: u64,
     total_down: u64,
     total_up: u64,
 }
 
-// refresh() 只更新已存在网卡的计数，不会发现新增/移除的网卡，
-// 因此每隔 LIST_REFRESH_INTERVAL 次用 refresh_list() 重建网卡列表
-const NET_LIST_REFRESH_INTERVAL: u32 = 30;
-
 lazy_static::lazy_static! {
     static ref NET_RATE: Mutex<NetRateState> = Mutex::new(NetRateState {
-        networks: Networks::new(),
+        networks: Networks::new().ok(),
         last_refresh: None,
-        ticks_since_list_refresh: 0,
         down_bps: 0,
         up_bps: 0,
         total_down: 0,
@@ -182,19 +217,18 @@ lazy_static::lazy_static! {
 // 刷新系统网络吞吐并计算速率与会话累计（回环接口不计入）
 fn update_net_rate() -> NetRate {
     let mut net = NET_RATE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(networks) = net.networks.as_mut() else {
+        return NetRate::default();
+    };
 
-    // 注意：必须先 refresh_list() 建立网卡列表，refresh() 才有数据可刷
-    if net.ticks_since_list_refresh == 0 {
-        net.networks.refresh_list();
-    } else {
-        net.networks.refresh();
-    }
-    net.ticks_since_list_refresh = (net.ticks_since_list_refresh + 1) % NET_LIST_REFRESH_INTERVAL;
+    // sysinfo 0.40 起 refresh(参数) 一次性完成网卡列表重建与计数刷新；
+    // true 会清除已移除的网卡（替代旧版每 30 次一轮的 refresh_list 轮换）
+    networks.refresh(true);
 
     let mut down_delta = 0u64;
     let mut up_delta = 0u64;
-    for (name, data) in net.networks.iter() {
-        let lower = name.to_lowercase();
+    for (name, data) in networks.iter() {
+        let lower = name.to_string_lossy().to_lowercase();
         // 排除回环与常见虚拟网卡（虚拟交换机/容器网桥会镜像物理网卡流量，
         // 直接相加会重复计数）。命名覆盖三平台：
         // Windows: vEthernet (WSL/Hyper-V)；Linux: lo/veth*/docker0/br-*；
@@ -797,7 +831,8 @@ fn build_connection(
     let process_info = pid.and_then(|p| process_map.get(&Pid::from_u32(p)));
 
     let process_name = match process_info {
-        Some(process) => Some(process.name().to_string()),
+        // sysinfo 0.40 起 name() 返回 &OsStr，lossy 转 UTF-8
+        Some(process) => Some(process.name().to_string_lossy().into_owned()),
         // 如果无法获取进程信息，可能是内核进程或权限不足，显示特殊标识
         None if pid.is_some() => Some("[KERNEL]".to_string()),
         None => None,
@@ -842,7 +877,7 @@ async fn get_connections() -> Result<ConnectionsSnapshot, String> {
     // 在全局 System 上做增量刷新，而不是每次调用都重建全量进程表；
     // 同一实例的两次刷新间隔也让进程的 CPU 占用有了计算基准
     let mut system = SYSTEM.lock().unwrap_or_else(|p| p.into_inner());
-    system.refresh_processes();
+    system.refresh_processes(ProcessesToUpdate::All, true);
 
     // 预先构建进程信息映射表，避免逐个 socket 重复查询
     let process_map: HashMap<Pid, &sysinfo::Process> = system
@@ -904,26 +939,32 @@ async fn get_net_rate() -> Result<NetRate, String> {
     Ok(update_net_rate())
 }
 
-// 从 sysinfo 进程条目组装详情（含命令行重组）
-fn build_process_details(pid: u32, process: &sysinfo::Process) -> ProcessDetails {
-    // sysinfo 的 cmd() 是按 argv 解析的（CommandLineToArgvW），原始引号已被剥离；
-    // 重组时给含空格的参数补回引号，避免参数内部的空格与参数分隔符混淆
-    let command_line = process
+// sysinfo 的 cmd() 是按 argv 解析的（CommandLineToArgvW），原始引号已被剥离；
+// 重组时给含空格的参数补回引号，避免参数内部的空格与参数分隔符混淆。
+// sysinfo 0.40 起参数为 OsString，统一 lossy 转成 UTF-8 字符串处理
+fn process_command_line(process: &sysinfo::Process) -> String {
+    process
         .cmd()
         .iter()
         .map(|arg| {
+            let arg = arg.to_string_lossy();
             if arg.contains(' ') || arg.contains('\t') {
                 format!("\"{}\"", arg.replace('"', "\\\""))
             } else {
-                arg.clone()
+                arg.into_owned()
             }
         })
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
+
+// 从 sysinfo 进程条目组装详情（含命令行重组）
+fn build_process_details(pid: u32, process: &sysinfo::Process) -> ProcessDetails {
+    let command_line = process_command_line(process);
 
     ProcessDetails {
         pid,
-        name: process.name().to_string(),
+        name: process.name().to_string_lossy().into_owned(),
         command_line,
         executable_path: process
             .exe()
@@ -944,7 +985,7 @@ async fn get_process_details(pid: u32) -> Result<ProcessDetails, String> {
     // （cmd 用 OnlyIfNotSet，进程存活期间只需读取一次）；②单进程刷新
     // 失败不代表进程不存在——权限受限的进程（如 Windows 的 System/pid 4）
     // 刷不动，但列表轮询的缓存里仍有它的数据，此时回退使用缓存。
-    let refresh_kind = ProcessRefreshKind::new()
+    let refresh_kind = ProcessRefreshKind::nothing()
         .with_memory()
         .with_cpu()
         .with_cmd(UpdateKind::OnlyIfNotSet)
@@ -952,7 +993,13 @@ async fn get_process_details(pid: u32) -> Result<ProcessDetails, String> {
 
     let mut system = SYSTEM.lock().unwrap_or_else(|p| p.into_inner());
     let pid_typed = Pid::from_u32(pid);
-    if !system.refresh_process_specifics(pid_typed, refresh_kind)
+    // sysinfo 0.40 起返回更新的进程数而非 bool；remove_dead 传 false，
+    // 保证刷新失败时轮询缓存的条目不被移除（下方回退要用）
+    if system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid_typed]),
+        false,
+        refresh_kind,
+    ) == 0
         && system.process(pid_typed).is_none()
     {
         return Err(format!("Process with PID {} not found", pid));
@@ -962,6 +1009,186 @@ async fn get_process_details(pid: u32) -> Result<ProcessDetails, String> {
         Some(process) => Ok(build_process_details(pid, process)),
         None => Err(format!("Process with PID {} not found", pid)),
     }
+}
+
+// 从 sysinfo 进程条目组装调用链节点（用户名靠 Users 列表解析；
+// 列表读取失败时为 None，节点的 user 字段退化为空）
+fn build_lineage_node(
+    pid: u32,
+    process: &sysinfo::Process,
+    parent_exited: bool,
+    is_target: bool,
+    users: Option<&Users>,
+) -> LineageNode {
+    let user = users.and_then(|users| {
+        process
+            .user_id()
+            .and_then(|uid| users.get_user_by_id(uid))
+            .map(|u| u.name().to_string())
+    });
+
+    LineageNode {
+        pid,
+        ppid: process.parent().map(|p| p.as_u32()),
+        name: process.name().to_string_lossy().into_owned(),
+        command_line: process_command_line(process),
+        exe_path: process
+            .exe()
+            .map(|path| path.to_string_lossy().to_string()),
+        start_time: Some(process.start_time()),
+        user,
+        icon: None, // 图标提取涉及文件 IO，统一在锁外按 exe_path 补齐
+        parent_exited,
+        is_target,
+    }
+}
+
+// 获取进程调用链：从目标进程沿 PPID 迭代向上直到 PID 1/0，
+// 每一跳都带三重防护——环检测、PID 回收检测、父进程消失检测。
+// 调用链基本静态（进程几乎不会换父进程），前端打开抽屉时拉取一次即可
+#[tauri::command]
+async fn get_process_lineage(pid: u32) -> Result<ProcessLineage, String> {
+    let refresh_kind = ProcessRefreshKind::nothing()
+        .with_memory()
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_exe(UpdateKind::OnlyIfNotSet);
+
+    let mut system = SYSTEM.lock().unwrap_or_else(|p| p.into_inner());
+    // 用户名解析依赖 Users 列表，调用一次全量刷新（开销可接受）；
+    // 读取失败时退化为 None，节点 user 字段为空但不影响调用链
+    let users = Users::new_with_refreshed_list().ok();
+
+    let mut chain_rev: Vec<LineageNode> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut current = pid;
+    // 下一跳父进程的启动时间必须早于它，否则说明 PPID 槽位被回收复用
+    let mut child_start_time: Option<u64> = None;
+
+    loop {
+        // PID 0 为根；seen 防环：异常 PPID 链（如内核数据竞争）直接终止
+        if current == 0 || !seen.insert(current) {
+            break;
+        }
+        let pid_typed = Pid::from_u32(current);
+        // 单进程刷新失败（返回 0）不代表不存在：权限受限的进程回退用
+        // 轮询缓存里的数据；remove_dead 传 false 保证缓存条目不被移除
+        if system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid_typed]),
+            false,
+            refresh_kind,
+        ) == 0
+            && system.process(pid_typed).is_none()
+        {
+            // 父进程确实读不到（已退出且无缓存）：在子节点上标记断裂
+            if let Some(last) = chain_rev.last_mut() {
+                last.parent_exited = true;
+            }
+            break;
+        }
+        let Some(process) = system.process(pid_typed) else {
+            break;
+        };
+
+        // PID 回收防护：父进程启动晚于子进程，说明原父进程已退出、
+        // 该 PPID 被新进程复用——不能把无关进程拼进链里，到此为止
+        let start_time = process.start_time();
+        if let Some(child_start) = child_start_time {
+            if start_time > child_start {
+                if let Some(last) = chain_rev.last_mut() {
+                    last.parent_exited = true;
+                }
+                break;
+            }
+        }
+
+        child_start_time = Some(start_time);
+        chain_rev.push(build_lineage_node(
+            current,
+            process,
+            false,
+            current == pid,
+            users.as_ref(),
+        ));
+
+        // ppid 拿不到（如部分内核进程）时终止
+        match process.parent() {
+            Some(p) => current = p.as_u32(),
+            None => break,
+        }
+    }
+    // 反转成 root → target 顺序
+    let mut nodes: Vec<LineageNode> = chain_rev;
+    nodes.reverse();
+
+    // 直接子进程：从已有进程表过滤即可（全量刷新由连接列表的秒级轮询负责）
+    let target_pid = Pid::from_u32(pid);
+    let mut children: Vec<LineageNode> = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| process.parent() == Some(target_pid))
+        .map(|(child_pid, process)| {
+            build_lineage_node(child_pid.as_u32(), process, false, false, users.as_ref())
+        })
+        .collect();
+    // 按 PID 排序保证展示稳定，并限制数量避免极端进程组（如浏览器多进程）刷屏
+    children.sort_by_key(|node| node.pid);
+    children.truncate(50);
+
+    // 图标提取可能较慢（文件 IO / icns 转换），先释放全局锁再进行
+    drop(system);
+    for node in nodes.iter_mut().chain(children.iter_mut()) {
+        if let Some(exe_path) = node.exe_path.as_deref() {
+            node.icon = get_process_icon_by_path(exe_path);
+        }
+    }
+
+    Ok(ProcessLineage { nodes, children })
+}
+
+// 实时解析某个端口当前的所有绑定（TCP/UDP、任意状态）及属主进程。
+// 供菜单栏"追踪"入口使用：不依赖前端快照的新鲜度，自动刷新关闭时也能查
+#[tauri::command]
+async fn get_port_bindings(port: u16) -> Result<Vec<PortBinding>, String> {
+    let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
+    let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
+    let sockets_info = get_sockets_info(af_flags, proto_flags).map_err(|e| e.to_string())?;
+
+    // 刷新进程表拿进程名（与连接列表同一套增量刷新）
+    let mut system = SYSTEM.lock().unwrap_or_else(|p| p.into_inner());
+    system.refresh_processes(ProcessesToUpdate::All, true);
+
+    let mut bindings = Vec::new();
+    for si in sockets_info {
+        let (protocol, local_addr, local_port, state) = match si.protocol_socket_info {
+            ProtocolSocketInfo::Tcp(tcp_si) => (
+                "TCP",
+                tcp_si.local_addr.to_string(),
+                tcp_si.local_port,
+                tcp_state_to_string(tcp_si.state).to_string(),
+            ),
+            ProtocolSocketInfo::Udp(udp_si) => (
+                "UDP",
+                udp_si.local_addr.to_string(),
+                udp_si.local_port,
+                "UNCONN".to_string(),
+            ),
+        };
+        if local_port != port {
+            continue;
+        }
+        let pid = si.associated_pids.first().copied();
+        let process_name = pid
+            .and_then(|p| system.process(Pid::from_u32(p)))
+            .map(|process| process.name().to_string_lossy().into_owned());
+        bindings.push(PortBinding {
+            protocol: protocol.to_string(),
+            local_addr,
+            state,
+            pid,
+            process_name,
+        });
+    }
+    Ok(bindings)
 }
 
 // 杀死进程
@@ -1235,6 +1462,8 @@ pub fn run() {
             get_connections,
             get_net_rate,
             get_process_details,
+            get_process_lineage,
+            get_port_bindings,
             get_app_settings,
             kill_process,
             open_folder,

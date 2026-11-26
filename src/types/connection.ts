@@ -49,6 +49,35 @@ export interface ProcessDetails {
   start_time: number;
 }
 
+// 调用链节点：祖先链与子进程列表共用
+export interface LineageNode {
+  pid: number;
+  ppid: number | null;
+  name: string;
+  command_line: string;
+  exe_path: string | null;
+  start_time: number | null;
+  user: string | null;
+  icon: string | null; // Base64 PNG，后端按 exe_path 复用全局图标缓存
+  parent_exited: boolean; // 该节点的父进程已退出（PID 被回收复用或已消失），链在此断裂
+  is_target: boolean; // 是否为当前查看的目标进程
+}
+
+// 进程调用链：沿 PPID 向上追溯到 PID 1 的完整祖先链 + 直接子进程
+export interface ProcessLineage {
+  nodes: LineageNode[]; // root → target 顺序
+  children: LineageNode[]; // 目标进程的直接子进程
+}
+
+// 端口绑定条目：get_port_bindings 按端口实时解析的结果
+export interface PortBinding {
+  protocol: string; // TCP / UDP
+  local_addr: string;
+  state: string; // LISTEN / ESTABLISHED / UNCONN ...
+  pid: number | null;
+  process_name: string | null;
+}
+
 // 排序相关类型
 export type SortColumn =
   | 'process_name'
