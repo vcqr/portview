@@ -1,6 +1,6 @@
 [package]
 name = "portview"
-version = "0.0.6"
+version = "0.0.7"
 description = "PortView is a cross-platform network connection port monitoring tool that displays TCP/UDP connections in real-time."
 authors = ["vcyang"]
 edition = "2021"
